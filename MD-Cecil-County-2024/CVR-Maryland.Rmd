@@ -1,0 +1,367 @@
+---
+title: "Cast Vote Record Analysis - Cecil County, MD 2024 General"
+author: "Earl F Glynn<br><small>watchdoglab.substack.com/</small>"
+date: "<small>`r Sys.Date()`</small>"
+output:
+  html_document:
+    code_download: true
+    theme: cerulean
+    toc: yes
+    toc_depth:  3
+    toc_float:
+      collapsed:  yes
+      smooth_scroll: yes
+    number_sections: yes
+    code_folding:  show
+---
+
+```{r setup, echo = FALSE}
+# http://biostat.mc.vanderbilt.edu/wiki/Main/KnitrHtmlTemplate
+require(Hmisc)    # provides knitrSet and other functions
+knitrSet(lang = 'markdown',   # If using blogdown: knitrSet(lang='blogdown')
+         fig.align = 'left',
+         w = 6.5,
+         h = 4.5,
+         cache = FALSE)
+```
+
+`r hidingTOC(buttonLabel = "Outline")`
+
+```{r startYourEngines, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = NA)
+
+time.1 <- Sys.time()
+```
+
+# Setup {.tabset .tabset-fade .tabset-pills}
+
+## {.active}
+
+## Constants
+
+```{r}
+EXCEL_LIMIT <- 2^20
+```
+
+## Packages
+
+```{r Packages}
+library(tidyverse)
+library(lubridate)
+```
+
+Display formatting
+
+```{r Display}
+library(kableExtra)  # kable_styling
+```
+
+I/O
+
+```{r IO}
+library(readxl)      # read_xlsx
+library(readr)       # write_csv
+library(writexl)     # write_xlsx
+```
+
+ Graphics
+
+```{r Graphics}
+library(scales)      # comma, comma_format
+```
+
+Utilities
+
+```{r Utilities}
+library(downloader)  # download
+library(tools)       # md5sum
+```
+
+## ggplot theme
+
+[ggplot Themes Gallery](https://www.datanovia.com/en/blog/ggplot-themes-gallery/)
+
+```{r ggplotTheme}
+theme_set(theme_minimal() +
+
+          theme(axis.text             = element_text(size = 10),
+                axis.title            = element_text(size = 14),
+
+                legend.position       = "bottom",
+
+                plot.caption          = element_text(hjust = c(0.0,1.0),
+                                                     size = 10),
+                plot.caption.position = "plot",
+
+                plot.title.position   = "plot",
+
+                strip.background      = element_rect(fill = "aliceblue"),
+                strip.text            = element_text(size = 14),
+
+                title                 = element_text(size = 14)))
+
+COLOR_BAR     <- "skyblue"
+COLOR_OUTLINE <- "grey80"
+```
+
+## Helper functions
+
+```{r Helpers}
+Show <- function(data, caption="", bigMark="",
+                 height = NULL, width = NULL, ...)
+{
+  data                                       |>
+  kable("html", caption=caption,
+        format.args=list(big.mark=bigMark))  |>
+  kable_styling(bootstrap_options=c("striped", "bordered", "condensed"),
+                position="left",
+                full_width=FALSE, ...)       |>
+  scroll_box(height = height, width = width)
+}
+```
+
+# Read CVR
+
+`Cecil.csv` was renamed from `cvr.csv` which was [downloaded from
+Jeff O'Donnell's site](https://votedatabase.com/cvr/Maryland/2024/Cecil/)
+
+Unclear where to find original information from [State of Maryland](https://elections.maryland.gov/press_room/index.html)
+
+```{r}
+cvr <- read_csv("Cecil.csv", 
+                show_col_types = FALSE,
+                guess_max = EXCEL_LIMIT)
+
+glimpse(cvr)
+```
+
+# Summary of Key Variables
+
+```{r}
+cvr |>
+  summarize(
+            n          = n(),
+            nUnique    = n_distinct(`Cast Vote Record`),
+            nPrecinct  = n_distinct(Precinct),
+            nStyle     = n_distinct(`Ballot Style`),
+            nPresident = n_distinct(`President and Vice President of the United States (500001630)`) 
+           )           |>
+  Show()
+```
+
+In this case one `Ballot Style` per `Precinct`
+
+# Gaps?
+
+Do we care?
+
+```{r}
+table(diff(cvr$`Cast Vote Record`))
+```
+
+# Precinct runs
+
+```{r}
+precinctRun <- rle(cvr$Precinct)   # run-length encoding lengths
+runs <- tibble(lengths = precinctRun$lengths, precinct = precinctRun$values)
+glimpse(runs)
+```
+
+```{r}
+table(runs$lengths)
+```
+
+Precincts with longest runs
+
+```{r}
+runs |> 
+  filter(lengths> 740) |>
+  arrange(lengths)     |>
+  Show()
+```
+
+
+# Frequency Counts
+
+## Presidential Candidates
+
+```{r}
+cvr |>
+  group_by(`President and Vice President of the United States (500001630)`) |>
+  count() |>
+  Show()
+```
+
+## Precincts
+
+### Presidential Vote
+
+```{r}
+presVote <- 
+  cvr |>
+  group_by(Precinct, 
+           `President and Vice President of the United States (500001630)`)  |>
+  count()                                                                    |>
+  spread(`President and Vice President of the United States (500001630)`, n) |>
+  ungroup()                                                                  |>
+  select(Precinct, starts_with("Harris"), starts_with("Trump"))              |>
+  rename(Harris = `Harris-Walz (10007007.0003640)`,
+         Trump  = `Trump-Vance (10007007.0000670)`)
+
+presVote |> head() |>  Show()
+
+```
+
+```{r}
+presTotal <- 
+  cvr |>
+  group_by(Precinct) |>
+  summarize(Voters = n()) |>
+  inner_join(presVote, by = "Precinct")
+
+presTotal |> Show()
+```
+
+### Ballot Style
+
+```{r}
+cvr |>
+  group_by(Precinct, `Ballot Style`) |>
+  count() |>
+  Show()
+```
+
+# Compute CVR Vote Ratio
+
+Use `coalesce` here to deal with NAs
+
+Use largest `Cast Vote Record` even though there were gaps.
+
+```{r}
+cvrRecode <- 
+  cvr |>
+  mutate(
+          Harris    = coalesce(as.integer(`President and Vice President of the United States (500001630)` == 
+                                 "Harris-Walz (10007007.0003640)"),
+                               0), 
+          Trump     = coalesce(as.integer(`President and Vice President of the United States (500001630)` == 
+                                 "Trump-Vance (10007007.0000670)"),
+                               0),
+
+          cumHarris = cumsum(Harris),
+          cumTrump  = cumsum(Trump),
+          VoteRatio = cumTrump / cumHarris,
+          
+          Percent   =  100 * `Cast Vote Record` / cvr$`Cast Vote Record`[nrow(cvr)]
+        )         
+```
+
+# Plot CVR Vote Ratio
+
+```{r CVR-Vote-Ratio, fig.width =10, fig.height = 8}
+Stamp          <- paste("efg", format(time.1, "%Y-%m-%d"))      
+
+ggplot(cvrRecode |> slice(-1),    # drop first row
+       aes(x = Percent,y = VoteRatio)) + 
+  geom_line(size = 2, color = "grey")       +
+  scale_x_continuous(breaks = 0:10 * 10)    +
+  scale_y_continuous(limits = c(0, 2.75),
+                     breaks = 0:11 * 0.25)   +
+  labs(
+        title    = "Trump/Harris Vote Ratio - Cecil County, MD",
+        subtitle = "Nov 2024 General Election",
+        x = "Cast Vote Record Percent Processed",
+        y = "Vote Ratio",    
+        panel.grid.minor.y = element_blank(),
+        caption = c("", Stamp)   
+  )
+```
+
+# Explore problem 
+
+Let's look at first 80% v last 20%
+
+```{r}
+problem <-
+  cvrRecode |>
+  filter(Percent >= 80,
+         Percent <= 97.5)
+
+dim(problem)
+```
+
+## First 80%
+
+```{r}
+firstVote <- 
+  cvrRecode |>
+   filter(Percent < 80)  |>
+  
+  group_by(Precinct, 
+           `President and Vice President of the United States (500001630)`)  |>
+  count()                                                                    |>
+  spread(`President and Vice President of the United States (500001630)`, n) |>
+  ungroup()                                                                  |>
+  
+  select(Precinct, starts_with("Harris"), starts_with("Trump"))              |>
+  rename(First80Harris = `Harris-Walz (10007007.0003640)`,
+         First80Trump  = `Trump-Vance (10007007.0000670)`)
+```
+
+## Last 20%
+
+```{r}
+lastVote <- 
+  cvrRecode |>
+   filter(Percent >= 80)  |>
+  
+  group_by(Precinct, 
+           `President and Vice President of the United States (500001630)`)  |>
+  count()                                                                    |>
+  spread(`President and Vice President of the United States (500001630)`, n) |>
+  ungroup()                                                                  |>
+  
+  select(Precinct, starts_with("Harris"), starts_with("Trump"))              |>
+  rename(Last20Harris = `Harris-Walz (10007007.0003640)`,
+         Last20Trump  = `Trump-Vance (10007007.0000670)`)
+```
+
+```{r}
+presTotal <- 
+  presTotal |>
+  left_join(firstVote, by = "Precinct") |>
+  left_join(lastVote, by = "Precinct")
+```
+
+```{r}
+presTotal |> Show()
+```
+
+```{r}
+write_xlsx(presTotal, "Presidential-Vote-by-Precinct.xlsx")
+```
+
+# Epilog {.tabset .tabset-fade .tabset-pills}
+
+## {.active}
+
+## Session Info
+
+```{r devtoolsSessionInfo}
+devtools::session_info()
+```
+
+</div>
+
+```{r epilogDeltaTime, echo=FALSE}
+time.2 <- Sys.time()
+processingTime <- paste("Processing time:", sprintf("%.1f",
+                        as.numeric(difftime(time.2,
+                                            time.1, units="secs"))), "secs\n")
+```
+
+`r processingTime`
+`r format(time.2, "%Y-%m-%d %H%M")`
+
